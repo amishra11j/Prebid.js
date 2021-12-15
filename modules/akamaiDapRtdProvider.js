@@ -4,7 +4,7 @@
  * The module will fetch real-time data from DAP
  * @module modules/akamaiDapRtdProvider
  * @requires module:modules/realTimeData
- */
+*/
 import {ajax} from '../src/ajax.js';
 import {config} from '../src/config.js';
 import {getStorageManager} from '../src/storageManager.js';
@@ -15,13 +15,15 @@ const MODULE_NAME = 'realTimeData';
 const SUBMODULE_NAME = 'dap';
 
 export const SEGMENTS_STORAGE_KEY = 'akamaiDapSegments';
+export const ENCRYPTED_SEGMENTS_STORAGE_KEY = 'akamaiDapEncryptedSegments'
+
 export const storage = getStorageManager(null, SUBMODULE_NAME);
 
 /**
  * Lazy merge objects.
  * @param {String} target
  * @param {String} source
- */
+*/
 function mergeLazy(target, source) {
   if (!isPlainObject(target)) {
     target = {};
@@ -60,7 +62,14 @@ export function getRealTimeData(bidConfig, onDone, rtdConfig, userConsent) {
   logInfo('DEBUG(getRealTimeData) - ENTER');
   logMessage('  - apiHostname: ' + rtdConfig.params.apiHostname);
   logMessage('  - apiVersion:  ' + rtdConfig.params.apiVersion);
-  let jsonData = storage.getDataFromLocalStorage(SEGMENTS_STORAGE_KEY);
+  var jsonData = null;
+  if (rtdConfig && isPlainObject(rtdConfig.params)) {
+    if (rtdConfig.params.segtax == 504) {
+      jsonData = storage.getDataFromLocalStorage(ENCRYPTED_SEGMENTS_STORAGE_KEY);
+    } else {
+      jsonData = storage.getDataFromLocalStorage(SEGMENTS_STORAGE_KEY);
+    }
+  }
   if (jsonData) {
     let data = JSON.parse(jsonData);
     if (data.rtd) {
@@ -70,7 +79,40 @@ export function getRealTimeData(bidConfig, onDone, rtdConfig, userConsent) {
       // Don't return - ensure the data is always fresh.
     }
   }
+  handleInit(bidConfig, onDone, rtdConfig, userConsent)
+}
 
+function handleInit(bidConfig, onDone, rtdConfig, userConsent) {
+  const p1 = new Promise((resolve, reject) => {
+    callDapAPIs(bidConfig, onDone, rtdConfig, userConsent, resolve);
+  });
+  var timeOut = 500;
+  if (rtdConfig.params.timeout) {
+    timeOut = rtdConfig.params.timeout;
+  }
+  logMessage('The timeout for handleSpecifiedTimeout() is ' + timeOut);
+  const p2 = new Promise((resolve, reject) => {
+    setTimeout(handleSpecifiedTimeout, timeOut, null, resolve);
+  });
+  Promise.race([p1, p2]).then((value) => {
+    logMessage('value is ' + value);
+    if (value) {
+      let data = JSON.parse(value);
+      if (data.rtd) {
+        addRealTimeData(data.rtd);
+        onDone();
+        logInfo('DEBUG(getRealTimeData) - 1');
+      }
+    }
+    onDone();
+  });
+}
+
+function handleSpecifiedTimeout(args, resolve) {
+  resolve(args);
+}
+
+function callDapAPIs(bidConfig, onDone, rtdConfig, userConsent, resolve) {
   if (rtdConfig && isPlainObject(rtdConfig.params)) {
     let config = {
       api_hostname: rtdConfig.params.apiHostname,
@@ -83,29 +125,48 @@ export function getRealTimeData(bidConfig, onDone, rtdConfig, userConsent) {
     };
     let token = dapUtils.dapGetToken(config, identity, rtdConfig.params.tokenTtl);
     if (token !== null) {
-      let membership = dapUtils.dapGetMembership(config, token);
-      let udSegment = dapUtils.dapMembershipToRtbSegment(membership, config);
-      logMessage('DEBUG(getRealTimeData) - token: ' + token + ', user.data.segment: ', udSegment);
-      let data = {
-        rtd: {
-          ortb2: {
-            user: {
-              data: [
-                udSegment
-              ]
-            },
-            site: {
-              ext: {
-                data: {
-                  dapSAID: membership.said
+      if (config.segtax == 504) {
+        let encToken = dapUtils.dapGetEncryptedMembership(config, token);
+        let udSegment = dapUtils.dapEncryptedMembershipToRtbSegment(encToken, config);
+        logMessage('DEBUG(getRealTimeData) - token: ' + token + ', encrypted user.data.segment: ', udSegment);
+        let encData = {
+          rtd: {
+            ortb2: {
+              user: {
+                data: [
+                  udSegment
+                ]
+              }
+            }
+          }
+        };
+        storage.setDataInLocalStorage(ENCRYPTED_SEGMENTS_STORAGE_KEY, JSON.stringify(encData));
+        resolve(JSON.stringify(encData));
+      } else {
+        let membership = dapUtils.dapGetMembership(config, token);
+        let udSegment = dapUtils.dapMembershipToRtbSegment(membership, config);
+        logMessage('DEBUG(getRealTimeData) - token: ' + token + ', user.data.segment: ', udSegment);
+        let data = {
+          rtd: {
+            ortb2: {
+              user: {
+                data: [
+                  udSegment
+                ]
+              },
+              site: {
+                ext: {
+                  data: {
+                    dapSAID: membership.said
+                  }
                 }
               }
             }
           }
-        }
-      };
-      storage.setDataInLocalStorage(SEGMENTS_STORAGE_KEY, JSON.stringify(data));
-      onDone();
+        };
+        storage.setDataInLocalStorage(SEGMENTS_STORAGE_KEY, JSON.stringify(data));
+        resolve(JSON.stringify(data));
+      }
     }
   }
 }
@@ -115,7 +176,7 @@ export function getRealTimeData(bidConfig, onDone, rtdConfig, userConsent) {
  * @param {Object} provider
  * @param {Object} userConsent
  * @return {boolean}
- */
+*/
 function init(provider, userConsent) {
   return true;
 }
@@ -215,6 +276,41 @@ export const dapUtils = {
     return membership;
   },
 
+  dapGetEncryptedMembership: function(config, token) {
+    let now = Math.round(Date.now() / 1000.0); // in seconds
+    let storageName = 'encrypted_dap_membership';
+    let maxTtl = 3600; // if the cached membership is older than this, return null
+    let encMembership = null;
+    let item = JSON.parse(localStorage.getItem(storageName));
+    if (item == null || (now - item.expires_at) > maxTtl) {
+      item = {
+        expires_at: now - 1,
+        encryptedSegments: null
+      };
+    } else {
+      encMembership = {
+        encryptedSegments: item.encryptedSegments
+      };
+    }
+
+    // Always refresh the cached membership.
+    let configAsync = {...config};
+    dapUtils.dapEncryptedMembership(configAsync, token,
+      function(encToken, status, xhr) {
+        item.expires_at = now + maxTtl;
+        item.encryptedSegments = encToken;
+        localStorage.setItem(storageName, JSON.stringify(item));
+        dapUtils.dapLog('Successfully updated and stored encrypted membership:');
+        dapUtils.dapLog(item);
+      },
+      function(xhr, status, error) {
+        logError('ERROR(' + error + '): failed to retrieve encrypted membership! ' + status);
+      }
+    );
+
+    return encMembership;
+  },
+
   /**
    * DESCRIPTION
    *
@@ -233,6 +329,26 @@ export const dapUtils = {
       for (const i of membership.cohorts) {
         segment.segment.push({ id: i });
       }
+    }
+    return segment;
+  },
+
+  /**
+   * DESCRIPTION
+   *
+   *  Convert a DAP membership response to an OpenRTB2 segment object suitable
+   *  for insertion into user.data.segment or site.data.segment.
+   */
+  dapEncryptedMembershipToRtbSegment: function(encToken, config) {
+    let segment = {
+      name: 'dap.akamai.com',
+      ext: {
+        'segtax': config.segtax
+      },
+      segment: []
+    };
+    if (encToken != null) {
+      segment.segment.push({ id: encToken.encryptedSegments });
     }
     return segment;
   },
@@ -384,7 +500,6 @@ export const dapUtils = {
       method: method,
       customHeaders: {
         'Content-Type': 'application/json',
-        'Pragma': 'akamai-x-cache-on'
       }
     });
   },
@@ -411,7 +526,7 @@ export const dapUtils = {
    *      api_hostname: 'api.dap.akadns.net',
    *      };
    *
-   *  // token from dap_x1_tokenize
+   *  // token from dap_tokenize
    *
    *  dapMembership( config, token,
    *      function( membership, status, xhr ) {
@@ -469,6 +584,93 @@ export const dapUtils = {
     ajax(url, cb, undefined, {
       method: 'GET',
       customHeaders: {}
+    });
+  },
+
+  /**
+   * SYNOPSIS
+   *
+   *  dapEncryptedMembership( config, token, onSuccess, onError );
+   *
+   * DESCRIPTION
+   *
+   *  Return the audience segment membership along with a new Secure Advertising
+   *  ID for this token in encrypted format.
+   *
+   * PARAMETERS
+   *
+   *  config: an array of system configuration parameters
+   *
+   *  token: the token previously returned from the tokenize API
+   *
+   * EXAMPLE
+   *
+   *  config = {
+   *      api_hostname: 'api.dap.akadns.net',
+   *      };
+   *
+   *  // token from dap_tokenize
+   *
+   *  dapEncryptedMembership( config, token,
+   *      function( membership, status, xhr ) {
+   *          // Run auction with membership.segments and membership.said after decryption
+   *      },
+   *      function( xhr, status, error ) {
+   *          // error
+   *      } );
+   *
+   */
+  dapEncryptedMembership: function(config, token, onSuccess = null, onError = null) {
+    if (onError == null) {
+      onError = function(xhr, status, error) {};
+    }
+
+    if (config == null || typeof (config) == typeof (undefined)) {
+      onError(null, 'Invalid config object', 'ClientError');
+      return;
+    }
+
+    if (!('api_version' in config) || (typeof (config.api_version) == 'string' && config.api_version.length == 0)) {
+      config.api_version = 'x1';
+    }
+
+    if (typeof (config.api_version) != 'string') {
+      onError(null, "Invalid api_version: must be a string like 'x1', etc.", 'ClientError');
+      return;
+    }
+
+    if (!(('api_hostname') in config) || typeof (config.api_hostname) != 'string' || config.api_hostname.length == 0) {
+      onError(null, 'Invalid api_hostname: must be a non-empty string', 'ClientError');
+      return;
+    }
+
+    if (token == null || typeof (token) != 'string') {
+      onError(null, 'Invalid token: must be a non-null string', 'ClientError');
+      return;
+    }
+    let path = '/data-activation/' +
+                  config.api_version +
+                  '/token/' + token +
+                  '/membership/encrypt';
+
+    let url = 'https://' + config.api_hostname + path;
+
+    let cb = {
+      success: (response, request) => {
+        let encToken = request.getResponseHeader('Akamai-DAP-Token');
+        onSuccess(encToken, request.status, request);
+      },
+      error: (error, request) => {
+        onError(request, request.status, error);
+      }
+    };
+
+    ajax(url, cb, undefined, {
+      method: 'GET',
+      customHeaders: {
+        'Content-Type': 'application/json',
+        'Pragma': 'akamai-x-get-extracted-values'
+      }
     });
   }
 }
